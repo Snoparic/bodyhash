@@ -3,9 +3,8 @@
 PREFIX ?= /usr/local
 BINDIR  = $(PREFIX)/bin
 MANDIR  = $(PREFIX)/share/man
-VERSION = 1.0.0
-# Ищем все скрипты в проекте (кроме скрытых папок)
-SCRIPTS := $(shell find . -type f \( -name "*.sh" -o -name "bodyhash" \) -not -path "*/.*")
+VERSION = 1.1.0
+SCRIPTS := bodyhash
 
 all: help
 
@@ -14,8 +13,8 @@ help:
 	@echo ""
 	@echo "Usage:"
 	@echo "  make ci           Run all checks (check + lint + test)"
-	@echo "  make check        Check syntax of all scripts (bash -n)"
-	@echo "  make lint         Run static analysis (shellcheck)"
+	@echo "  make check        Check syntax (bash -n)"
+	@echo "  make lint         Run static analysis (shellcheck, if installed)"
 	@echo "  make test         Run test suite (bats)"
 	@echo "  make install      Install to $(DESTDIR)$(PREFIX)"
 	@echo "  make uninstall    Remove from $(DESTDIR)$(PREFIX)"
@@ -50,7 +49,13 @@ lint:
 	fi
 
 test:
-	bats tests/
+	@if command -v bats >/dev/null 2>&1; then \
+		bats tests/; \
+	else \
+		echo "Error: bats not installed. Install it, e.g.:"; \
+		echo "  apt-get install bats   |   dnf install bats   |   npm install -g bats"; \
+		exit 1; \
+	fi
 
 ci: check lint test
 	@echo "========================================"
@@ -58,7 +63,7 @@ ci: check lint test
 	@echo "========================================"
 
 dist: clean
-	tar -czf bodyhash-$(VERSION).tar.gz bodyhash man/ tests/ Makefile README.md LICENSE
+	tar -czf bodyhash-$(VERSION).tar.gz bodyhash man/ tests/ Makefile README.md CHANGELOG.md LICENSE
 	@echo "Created bodyhash-$(VERSION).tar.gz"
 
 clean:

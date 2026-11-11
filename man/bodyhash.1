@@ -1,4 +1,4 @@
-.TH BODYHASH 1 "2026-11-11" "bodyhash 1.0.0" "User Commands"
+.TH BODYHASH 1 "2026-11-11" "bodyhash 1.1.0" "User Commands"
 .SH NAME
 bodyhash \- hash a file body, excluding marked regions
 .SH SYNOPSIS
@@ -12,25 +12,37 @@ computes a hash of file content, excluding any regions delimited by
 user-specified marker pairs. By default, it normalizes line endings, strips
 UTF-8 BOM, and removes trailing whitespace to ensure consistent hashes
 across different operating systems and editors.
+.PP
+Every requested \fI\-\-exclude\fR pair must be found in the file, and every
+START must be closed by its END; otherwise
+.B bodyhash
+fails with exit code 3 instead of silently hashing a truncated body.
 .SH COMMANDS
 .TP
 .B hash
 Output the hash of the file body.
 .TP
 .B check
-Compare the file body hash with an expected value. Exits 0 if they match, 1 otherwise.
+Compare the file body hash with an expected value (case-insensitive).
+Exits 0 if they match, 1 otherwise.
 .TP
 .B markers
 Display the line numbers where the specified markers are found.
 .SH OPTIONS
 .TP
 .BR \-e ", " \-\-exclude =\fISTART::END\fR
-Exclude the block from \fISTART\fR to \fIEND\fR. Both lines are excluded.
+Exclude every block delimited by the literal markers \fISTART\fR and
+\fIEND\fR (both boundary lines are excluded). The pair is split on the
+first "::"; markers may not contain "::" and must be non-empty.
 This option can be used multiple times.
 .TP
 .BR \-a ", " \-\-algo =\fIALGO\fR
-Specify the hash algorithm. Supported: \fBsha256\fR (default), \fBsha512\fR, \fBsha3-256\fR, \fBsha3-512\fR, \fBblake2b\fR, \fBblake2s\fR, \fBmd5\fR.
-Algorithms other than sha256/md5/blake2b require \fBopenssl\fR to be installed.
+Specify the hash algorithm. Supported: \fBsha256\fR (default), \fBsha512\fR,
+\fBmd5\fR, \fBblake2b\fR, \fBblake2s\fR, \fBsha3-256\fR, \fBsha3-512\fR.
+The hashing backend is auto-detected: \fIsha256sum\fR/\fIsha512sum\fR/\fImd5sum\fR/\fIb2sum\fR
+(GNU), then \fIshasum\fR/\fImd5\fR (BSD/macOS), then \fIopenssl dgst\fR
+(the only backend for \fBsha3-*\fR and \fBblake2s\fR). All backends produce
+identical digests for the same algorithm.
 .TP
 .B \-\-no\-normalize\-crlf
 Do not convert CRLF/CR to LF. By default, line endings are normalized.
@@ -51,7 +63,9 @@ Keep leading whitespace (default).
 Remove leading whitespace from each line before hashing.
 .TP
 .B \-\-indent\-tabs=\fIN\fR
-Replace tab characters with \fIN\fR spaces before hashing.
+Expand tab characters to the next multiple of \fIN\fR columns before
+hashing. Uses \fIexpand\fR when available, otherwise a built-in awk
+fallback with the same tab-stop math. \fIN\fR must be a positive integer.
 .TP
 .B \-\-exclude\-preamble
 Skip the content before the first START marker.
@@ -60,13 +74,13 @@ Skip the content before the first START marker.
 Skip the content after the last END marker.
 .TP
 .B \-\-strict\-start
-Fail if the first START marker is not on line 1.
+Fail if the first START marker is not on line 1 (exit code 2).
 .TP
 .BR \-v ", " \-\-verbose
 Enable verbose output (e.g., print OK on successful check).
 .TP
 .BR \-q ", " \-\-quiet
-Suppress all output except errors.
+Suppress the verbose OK message; errors are still printed.
 .SH "EXIT STATUS"
 .TP
 .B 0
@@ -76,10 +90,12 @@ Success (hash matched).
 Hash mismatch (check command only).
 .TP
 .B 2
-Invalid arguments or marker order (end before start).
+Invalid arguments: unknown option, malformed \fISTART::END\fR, invalid
+\fI\-\-indent\-tabs\fR value, or strict-start failure.
 .TP
 .B 3
-Marker pair not found.
+Marker pair not found: START missing, END missing (unterminated block),
+or a repeated \fI\-e\fR pair absent from the file.
 .TP
 .B 4
 File not found.
@@ -88,7 +104,14 @@ File not found.
 Internal error (e.g., hasher produced no output).
 .TP
 .B 6
-Unsupported algorithm, or algorithm requires missing \fBopenssl\fR.
+Unsupported algorithm, or no hashing tool available for it.
+.SH NOTES
+The tool is locale-independent: awk and grep are always invoked with
+.B LC_ALL=C
+(byte semantics), so hashes are identical regardless of the system locale
+and the awk implementation (gawk, mawk, BSD awk, busybox awk). In
+particular, the UTF-8 BOM is stripped correctly even in UTF-8 locales,
+where gawk would otherwise treat it as a single character.
 .SH EXAMPLES
 .TP
 Hash the body of a C file, excluding the Doxygen header:
@@ -100,6 +123,12 @@ Verify the hash against a known value:
 .EX
 bodyhash check file.c 1857616f15bd53f72c1733a1839421116c7bbb50579f2cdb9ceca9adfcd30fda \-e '/**::*/'
 .EE
+.TP
+Exclude a metadata header and a volatile block at once:
+.EX
+bodyhash hash file.conf \-e '[META::[/META]' \-e '<volatile::</volatile>'
+.EE
 .SH "SEE ALSO"
 .BR sha256sum (1),
+.BR shasum (1),
 .BR openssl (1)

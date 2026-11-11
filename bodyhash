@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: 2026 Эрик Гусейнов-Соболь <Snoparic.job@mail.ru> (@Snoparic)
 # SPDX-License-Identifier: MIT
+#
+# bodyhash — hash of a file body, excluding marker-delimited regions.
+#
+# Portability: Linux (GNU coreutils), macOS (BSD userland), Git Bash / WSL.
+# Only POSIX tools are required; the hash backend is auto-detected:
+#   sha256sum/sha512sum/md5sum/b2sum (GNU) -> shasum/md5 (BSD/macOS) -> openssl.
+# Normalization (CRLF, BOM, trailing/leading whitespace) is done in awk
+# that is always invoked with LC_ALL=C: byte semantics regardless of the
+# system locale. Without it gawk in a UTF-8 locale treats the BOM as a
+# single character, and byte-wise stripping silently stops working.
+# No GNU-only sed escapes are used anywhere.
+
 set -euo pipefail
 
 PROGNAME=bodyhash
-VERSION=1.0.0
+VERSION=1.1.0
 
 declare -a EXCLUDES=()
 ALGO=sha256
@@ -22,130 +34,232 @@ QUIET=0
 usage() {
     cat <<'USAGE'
 Usage:
-  bodyhash hash    FILE -e START::END [OPTIONS]
-  bodyhash check   FILE HASH -e START::END [OPTIONS]
-  bodyhash markers FILE -e START::END
+  bodyhash hash    FILE [-e START::END ...] [OPTIONS]
+  bodyhash check   FILE HASH [-e START::END ...] [OPTIONS]
+  bodyhash markers FILE [-e START::END ...]
   bodyhash version | help
 
-Options:
-  -e, --exclude START::END    exclude block between markers (repeatable)
-  -a, --algo ALGO             sha256 (default) | sha512 | sha3-256 | sha3-512
-                              | blake2b | blake2s | md5
-  --no-normalize-crlf         keep CRLF/CR
-  --no-strip-bom              keep UTF-8 BOM
-  --strip-trailing-ws         strip trailing whitespace (default)
-  --no-strip-trailing-ws      keep trailing whitespace per line
-  --strip-leading-ws          strip leading whitespace per line
-  --no-strip-leading-ws       keep leading whitespace per line (default)
-  --indent-tabs=N             tabs -> N spaces
-  --exclude-preamble          skip content before first START
-  --exclude-epilogue          skip content after last END
-  --strict-start              fail if START not on line 1
-  -v, --verbose
-  -q, --quiet
+Commands:
+  hash     print the body hash of FILE
+  check    compare body hash of FILE with expected HASH (exit 0 on match)
+  markers  print line numbers of the START/END markers
 
-Exit: 0 ok, 1 mismatch, 2 args, 3 marker, 4 file, 5 internal, 6 algo
+Options:
+  -e, --exclude START::END    exclude block between literal markers,
+                              boundary lines included (repeatable)
+  -a, --algo ALGO             sha256 (default) | sha512 | md5 | blake2b
+                              | blake2s | sha3-256 | sha3-512
+  --no-normalize-crlf         keep CRLF/CR endings (default: CRLF -> LF)
+  --no-strip-bom              keep UTF-8 BOM (default: strip)
+  --no-strip-trailing-ws      keep trailing whitespace (default: strip)
+  --strip-leading-ws          strip leading whitespace per line (default: keep)
+  --indent-tabs=N             expand tabs to the next multiple of N columns
+  --exclude-preamble          skip content before the first START marker
+  --exclude-epilogue          skip content after the last END marker
+  --strict-start              fail if the first START marker is not on line 1
+  -v, --verbose               print "FILE: OK" on successful check
+  -q, --quiet                 suppress the verbose OK message
+
+Exit codes:
+  0 ok, 1 mismatch (check), 2 usage error, 3 marker not found,
+  4 file not found, 5 internal error, 6 unsupported algo / no hashing tool
+
+Notes:
+  * Markers are literal substrings, not regexps.
+  * START::END is split on the first "::"; markers may not contain "::".
+  * Every -e pair must be present in the file, and every START must be
+    closed by its END, otherwise the command fails with exit code 3.
+  * Hash tools are auto-detected per algorithm:
+    sha256sum/sha512sum/md5sum/b2sum, then shasum/md5 (BSD/macOS),
+    then openssl dgst (always for sha3-*/blake2s).
 USAGE
 }
 
-die() { echo "$PROGNAME: $*" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
 
-run_hasher() {
-    local algo=$1
-    case $algo in
-        sha256)   sha256sum | cut -d' ' -f1 ;;
-        sha512)   sha512sum | cut -d' ' -f1 ;;
-        md5)      md5sum    | cut -d' ' -f1 ;;
-        blake2b)  b2sum -l 512 | cut -d' ' -f1 ;;
-        sha3-256|sha3-512|blake2s)
-            if command -v openssl >/dev/null 2>&1; then
-                openssl dgst -"$algo" -r | cut -d' ' -f1
-            else
-                echo "algo $algo requires openssl" >&2; return 6
-            fi ;;
-        *) echo "unsupported algo: $algo" >&2; return 6 ;;
+die() { printf '%s: %s\n' "$PROGNAME" "$1" >&2; exit "${2:-2}"; }
+
+# Validate ALGO (cheap, before touching the file). Tool presence is
+# checked later inside run_hasher, per algorithm.
+validate_algo() {
+    case $ALGO in
+        sha256|sha512|md5|blake2b|blake2s|sha3-256|sha3-512) ;;
+        *) die "unsupported algorithm: $ALGO" 6 ;;
     esac
 }
 
-extract_body() {
+# Validate a START::END pair: exactly one separator, non-empty halves.
+parse_exclude() {
+    local ex=$1
+    case $ex in
+        *"::"*) ;;
+        *) die "invalid exclude '$ex': expected START::END" 2 ;;
+    esac
+    local rest="${ex#*::}"
+    case $rest in
+        *::*) die "invalid exclude '$ex': more than one '::'" 2 ;;
+    esac
+    local s="${ex%%::*}" e="${ex##*::}"
+    [ -n "$s" ] || die "invalid exclude '$ex': empty START" 2
+    [ -n "$e" ] || die "invalid exclude '$ex': empty END" 2
+}
+
+# Hash the pipeline input. Auto-detect a backend for ALGO; the hash is
+# algorithm-defined, so any backend produces the same digest.
+run_hasher() {
+    local algo=$1
+    case $algo in
+        sha256|sha512)
+            local sum="${algo}sum" bits="${algo#sha}"
+            if have "$sum"; then "$sum" | cut -d' ' -f1
+            elif have shasum; then shasum -a "$bits" | cut -d' ' -f1
+            elif have openssl; then openssl dgst -"$algo" | awk '{print $NF}'
+            else die "no backend for $algo (need ${sum}, shasum or openssl)" 6
+            fi ;;
+        md5)
+            if have md5sum; then md5sum | cut -d' ' -f1
+            elif have md5; then md5 -q
+            elif have openssl; then openssl dgst -md5 | awk '{print $NF}'
+            else die "no backend for md5 (need md5sum, md5 or openssl)" 6
+            fi ;;
+        blake2b)
+            if have b2sum; then b2sum -l 512 | cut -d' ' -f1
+            elif have openssl; then openssl dgst -blake2b512 | awk '{print $NF}'
+            else die "no backend for blake2b (need b2sum or openssl)" 6
+            fi ;;
+        blake2s)
+            if have openssl; then openssl dgst -blake2s256 | awk '{print $NF}'
+            else die "blake2s requires openssl" 6
+            fi ;;
+        sha3-256|sha3-512)
+            if have openssl; then openssl dgst -"$algo" | awk '{print $NF}'
+            else die "$algo requires openssl" 6
+            fi ;;
+        *) die "unsupported algorithm: $algo" 6 ;;
+    esac
+}
+
+# Single awk pass pair: cut marker blocks and normalize the surviving lines.
+#
+# Pass 1 (main block) records each line and whether it falls inside a
+# marker block: a line containing START opens a block, a line containing
+# END closes it; a line that both opens and closes a block is fully
+# excluded; every block of every -e pair is cut.
+#
+# Pass 2 (END block) validates the pairs (every START/END must occur,
+# otherwise exit 3), applies --exclude-preamble/--exclude-epilogue using
+# the FINAL block coordinates (streaming would be wrong with multiple
+# pairs), normalizes the surviving lines and prints them:
+#   BOM (first printed line) -> CRLF -> trailing ws -> leading ws.
+# Tabs are expanded afterwards by expand_tabs().
+process() {
     local file=$1 ex_flat=$2
-    awk -v ex="$ex_flat" \
+    # LC_ALL=C forces byte semantics in every awk (gawk/mawk/BSD/busybox)
+    # under any system locale; see the header comment above.
+    LC_ALL=C awk -v ex="$ex_flat" \
+        -v strip_bom="$STRIP_BOM" \
+        -v norm_crlf="$NORM_CRLF" \
+        -v strip_trail="$STRIP_TRAIL_WS" \
+        -v strip_lead="$STRIP_LEAD_WS" \
         -v excl_pre="$EXCL_PREAMBLE" \
         -v excl_epi="$EXCL_EPILOGUE" \
         -v strict="$STRICT_START" '
     BEGIN {
+        bom = "\357\273\277"   # UTF-8 BOM as raw bytes (LC_ALL=C)
         n = (ex == "") ? 0 : split(ex, pairs, "@@")
-        for (i=1; i<=n; i++) {
+        for (i = 1; i <= n; i++) {
             split(pairs[i], se, "::")
-            starts[i]=se[1]; ends[i]=se[2]; sl[i]=0; el[i]=0
+            starts[i] = se[1]; ends[i] = se[2]
+            in_block[i] = 0; opened[i] = 0; closed[i] = 0
         }
+        found_start = 0; last_end = 0; printed = 0
     }
     {
-        lines[NR]=$0
-        for (i=1; i<=n; i++) {
-            if (sl[i]==0 && index($0, starts[i])>0) sl[i]=NR
-            else if (sl[i]>0 && el[i]==0 && NR>sl[i] && index($0, ends[i])>0) el[i]=NR
+        lines[NR] = $0
+        skip = 0
+        for (i = 1; i <= n; i++) {
+            if (!in_block[i] && index($0, starts[i]) > 0) {
+                in_block[i] = 1; opened[i] = 1
+                if (found_start == 0) found_start = NR
+            }
+            if (in_block[i]) skip = 1
+            if (in_block[i] && index($0, ends[i]) > 0) {
+                in_block[i] = 0; closed[i] = 1
+                if (NR > last_end) last_end = NR
+            }
         }
+        skipped[NR] = skip
     }
     END {
-        for (i=1; i<=n; i++) {
-            if (sl[i]==0) { print "marker not found: " starts[i] > "/dev/stderr"; exit 3 }
-            if (el[i]==0) { print "marker not found: " ends[i] > "/dev/stderr"; exit 3 }
-            if (el[i]<sl[i]) { print "end before start: " starts[i] > "/dev/stderr"; exit 2 }
+        for (i = 1; i <= n; i++) {
+            if (!opened[i]) { print "marker not found: " starts[i] > "/dev/stderr"; exit 3 }
+            if (!closed[i]) { print "marker not found: " ends[i]   > "/dev/stderr"; exit 3 }
         }
-        min_s=0; max_e=0
-        for (i=1; i<=n; i++) {
-            if (min_s==0 || sl[i]<min_s) min_s=sl[i]
-            if (el[i]>max_e) max_e=el[i]
-        }
-        if (strict && min_s>1) { print "strict-start: preamble not empty" > "/dev/stderr"; exit 2 }
-        for (nr=1; nr<=NR; nr++) {
-            skip=0
-            for (i=1; i<=n; i++)
-                if (sl[i]>0 && el[i]>0 && nr>=sl[i] && nr<=el[i]) skip=1
-            if (excl_pre && min_s>0 && nr<min_s) skip=1
-            if (excl_epi && max_e>0 && nr>max_e) skip=1
-            if (!skip) print lines[nr]
+        if (strict && found_start > 1) { print "strict-start: preamble not empty" > "/dev/stderr"; exit 2 }
+        for (nr = 1; nr <= NR; nr++) {
+            if (skipped[nr]) continue
+            if (excl_pre && found_start > 0 && nr < found_start) continue
+            if (excl_epi && last_end > 0 && nr > last_end) continue
+            line = lines[nr]
+            if (printed == 0 && strip_bom == 1 && substr(line, 1, 3) == bom)
+                line = substr(line, 4)
+            printed = 1
+            if (norm_crlf == 1) sub(/\r$/, "", line)
+            if (strip_trail == 1) {
+                if (norm_crlf == 1) gsub(/[ \t\r\f\v]+$/, "", line)
+                else                gsub(/[ \t]+$/, "", line)
+            }
+            if (strip_lead == 1) sub(/^[ \t\r\f\v]*/, "", line)
+            print line
         }
     }' "$file"
 }
 
-normalize() {
-    local -a seds=()
-    [ "$STRIP_BOM"      = 1 ] && seds+=(-e '1s/^\xEF\xBB\xBF//')
-    [ "$NORM_CRLF"      = 1 ] && seds+=(-e 's/\r$//')
-    if [ "$STRIP_TRAIL_WS" = 1 ]; then
-        if [ "$NORM_CRLF" = 1 ]; then
-            seds+=(-e 's/[[:space:]]*$//')
+# Expand tabs to N-column stops. GNU/BSD expand is preferred; a pure-awk
+# fallback keeps the tool working where expand is missing (identical math:
+# a tab advances to the next multiple of N).
+expand_tabs() {
+    local n=$INDENT_TABS
+    if [ "$n" -gt 0 ]; then
+        if have expand; then
+            expand -t "$n"
         else
-            seds+=(-e 's/[ \t]*$//') # Не трогаем \r
-        fi
-    fi
-    [ "$STRIP_LEAD_WS"  = 1 ] && seds+=(-e 's/^[[:space:]]*//')
-    if [ ${#seds[@]} -gt 0 ]; then
-        if [ "$INDENT_TABS" -gt 0 ]; then sed "${seds[@]}" | expand -t "$INDENT_TABS"
-        else                                sed "${seds[@]}"
+            LC_ALL=C awk -v n="$n" '{
+                out = ""; col = 0
+                spaces = "                                "
+                for (i = 1; i <= length($0); i++) {
+                    c = substr($0, i, 1)
+                    if (c == "\t") {
+                        k = n - (col % n)
+                        while (k > length(spaces)) spaces = spaces spaces
+                        out = out substr(spaces, 1, k)
+                        col = col + k
+                    } else {
+                        out = out c
+                        col++
+                    }
+                }
+                print out
+            }'
         fi
     else
-        if [ "$INDENT_TABS" -gt 0 ]; then expand -t "$INDENT_TABS"
-        else                                cat
-        fi
+        cat
     fi
 }
 
 compute_hash() {
     local file=$1
-    [ -f "$file" ] || die "file not found: $file"
-    local ex_flat=""
-    for ex in "${EXCLUDES[@]}"; do
-        [ -n "$ex_flat" ] && ex_flat="$ex_flat@@$ex" || ex_flat="$ex"
+    [ -f "$file" ] || die "file not found: $file" 4
+    local ex_flat="" ex
+    for ex in ${EXCLUDES[@]+"${EXCLUDES[@]}"}; do
+        [ -n "$ex_flat" ] && ex_flat="${ex_flat}@@${ex}" || ex_flat="$ex"
     done
-    
+
     local h
-    h=$(extract_body "$file" "$ex_flat" | normalize | run_hasher "$ALGO")
+    h=$(process "$file" "$ex_flat" | expand_tabs | run_hasher "$ALGO")
     if [ -z "$h" ]; then
-        echo "$PROGNAME: internal error: empty hash for $file" >&2
-        return 5
+        printf '%s: internal error: empty hash for %s\n' "$PROGNAME" "$file" >&2
+        exit 5
     fi
     printf '%s\n' "$h"
 }
@@ -154,54 +268,69 @@ cmd_hash() { compute_hash "$1"; }
 
 cmd_check() {
     local file=$1 expected=$2
-    [ -n "$expected" ] || die "usage: check FILE HASH"
+    [ -n "$expected" ] || die "usage: check FILE HASH" 2
     local actual
     actual=$(compute_hash "$file") || return $?
+    # Compare case-insensitively: hashes are lowercase, humans type upper.
+    expected=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
     if [ "$actual" = "$expected" ]; then
         if [ "$VERBOSE" = 1 ] && [ "$QUIET" = 0 ]; then
-            echo "$file: OK"
+            printf '%s: OK\n' "$file"
         fi
         return 0
     fi
-    echo "$file: mismatch (expected $expected, got $actual)" >&2
+    printf '%s: mismatch (expected %s, got %s)\n' "$file" "$expected" "$actual" >&2
     return 1
 }
 
 cmd_markers() {
     local file=$1
-    [ -f "$file" ] || die "file not found: $file"
-    for ex in "${EXCLUDES[@]}"; do
-        local s="${ex%%::*}" e="${ex##*::}"
-        local sl el
-        sl=$(grep -nF -- "$s" "$file" | head -1 | cut -d: -f1)
-        el=""
-        if [ -n "$sl" ]; then
-            el=$(awk -v sl="$sl" -v e="$e" 'NR > sl && index($0, e) { print NR; exit }' "$file")
-        fi
-        printf '%s: START %s at %s\n' "$file" "$s" "${sl:-?}"
-        printf '%s: END   %s at %s\n' "$file" "$e" "${el:-?}"
+    [ -f "$file" ] || die "file not found: $file" 4
+    local ex s e sl el
+    for ex in ${EXCLUDES[@]+"${EXCLUDES[@]}"}; do
+        s="${ex%%::*}"
+        e="${ex##*::}"
+        sl=$(LC_ALL=C grep -nF -- "$s" "$file" | head -1 | cut -d: -f1 || true)
+        [ -n "$sl" ] || die "marker not found: $s" 3
+        # END is searched from the START line on, so single-line blocks
+        # (START and END on the same line) are reported correctly.
+        el=$(LC_ALL=C awk -v sl="$sl" -v e="$e" 'NR >= sl && index($0, e) { print NR; exit }' "$file" || true)
+        [ -n "$el" ] || die "marker not found: $e" 3
+        printf '%s: START %s at %s\n' "$file" "$s" "$sl"
+        printf '%s: END   %s at %s\n' "$file" "$e" "$el"
     done
 }
 
 parse_opts() {
     while [ $# -gt 0 ]; do
         case $1 in
-            -e|--exclude) EXCLUDES+=("$2"); shift 2 ;;
-            -a|--algo)    ALGO="$2"; shift 2 ;;
+            -e|--exclude)
+                [ $# -ge 2 ] || die "option '$1' requires an argument" 2
+                parse_exclude "$2"
+                EXCLUDES+=("$2"); shift 2 ;;
+            -a|--algo)
+                [ $# -ge 2 ] || die "option '$1' requires an argument" 2
+                ALGO="$2"; shift 2 ;;
             --no-normalize-crlf)    NORM_CRLF=0; shift ;;
             --no-strip-bom)         STRIP_BOM=0; shift ;;
             --strip-trailing-ws)    STRIP_TRAIL_WS=1; shift ;;
             --no-strip-trailing-ws) STRIP_TRAIL_WS=0; shift ;;
             --strip-leading-ws)     STRIP_LEAD_WS=1; shift ;;
             --no-strip-leading-ws)  STRIP_LEAD_WS=0; shift ;;
-            --indent-tabs=*)        INDENT_TABS="${1#*=}"; shift ;;
+            --indent-tabs=*)
+                INDENT_TABS="${1#*=}"
+                case $INDENT_TABS in
+                    ''|*[!0-9]*) die "invalid --indent-tabs value: '$INDENT_TABS'" 2 ;;
+                esac
+                [ "$INDENT_TABS" -ge 1 ] || die "--indent-tabs must be >= 1" 2
+                shift ;;
             --exclude-preamble)     EXCL_PREAMBLE=1; shift ;;
             --exclude-epilogue)     EXCL_EPILOGUE=1; shift ;;
             --strict-start)         STRICT_START=1; shift ;;
             -v|--verbose)           VERBOSE=1; shift ;;
             -q|--quiet)             QUIET=1; shift ;;
             --) shift; POSITIONAL+=("$@"); return ;;
-            -*) die "unknown option: $1" ;;
+            -*) die "unknown option: $1" 2 ;;
             *)  POSITIONAL+=("$1"); shift ;;
         esac
     done
@@ -212,17 +341,19 @@ main() {
     local cmd=$1; shift
     case $cmd in
         help|-h|--help)       usage; exit 0 ;;
-        version|-V|--version) echo "$PROGNAME $VERSION"; exit 0 ;;
+        version|-V|--version) printf '%s %s\n' "$PROGNAME" "$VERSION"; exit 0 ;;
         hash|check|markers)   ;;
-        *) die "unknown command: $cmd" ;;
+        *) die "unknown command: $cmd" 2 ;;
     esac
     declare -a POSITIONAL=()
     parse_opts "$@"
-    [ ${#POSITIONAL[@]} -gt 0 ] || die "no input file"
+    validate_algo
+    [ "${#POSITIONAL[@]}" -gt 0 ] || die "no input file" 2
     case $cmd in
         hash)    cmd_hash    "${POSITIONAL[0]}" ;;
         check)   cmd_check   "${POSITIONAL[0]}" "${POSITIONAL[1]:-}" ;;
         markers) cmd_markers "${POSITIONAL[0]}" ;;
     esac
 }
+
 main "$@"
