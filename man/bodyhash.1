@@ -1,0 +1,105 @@
+.TH BODYHASH 1 "2026-11-11" "bodyhash 1.0.0" "User Commands"
+.SH NAME
+bodyhash \- hash a file body, excluding marked regions
+.SH SYNOPSIS
+.B bodyhash
+.BR hash | check | markers
+.I FILE
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B bodyhash
+computes a hash of file content, excluding any regions delimited by
+user-specified marker pairs. By default, it normalizes line endings, strips
+UTF-8 BOM, and removes trailing whitespace to ensure consistent hashes
+across different operating systems and editors.
+.SH COMMANDS
+.TP
+.B hash
+Output the hash of the file body.
+.TP
+.B check
+Compare the file body hash with an expected value. Exits 0 if they match, 1 otherwise.
+.TP
+.B markers
+Display the line numbers where the specified markers are found.
+.SH OPTIONS
+.TP
+.BR \-e ", " \-\-exclude =\fISTART::END\fR
+Exclude the block from \fISTART\fR to \fIEND\fR. Both lines are excluded.
+This option can be used multiple times.
+.TP
+.BR \-a ", " \-\-algo =\fIALGO\fR
+Specify the hash algorithm. Supported: \fBsha256\fR (default), \fBsha512\fR, \fBsha3-256\fR, \fBsha3-512\fR, \fBblake2b\fR, \fBblake2s\fR, \fBmd5\fR.
+Algorithms other than sha256/md5/blake2b require \fBopenssl\fR to be installed.
+.TP
+.B \-\-no\-normalize\-crlf
+Do not convert CRLF/CR to LF. By default, line endings are normalized.
+.TP
+.B \-\-no\-strip\-bom
+Do not strip the UTF-8 BOM (Byte Order Mark) from the beginning of the file.
+.TP
+.B \-\-no\-strip\-trailing\-ws
+Do not remove trailing whitespace from each line before hashing.
+.TP
+.B \-\-strip\-trailing\-ws
+Strip trailing whitespace (default).
+.TP
+.B \-\-no\-strip\-leading\-ws
+Keep leading whitespace (default).
+.TP
+.B \-\-strip\-leading\-ws
+Remove leading whitespace from each line before hashing.
+.TP
+.B \-\-indent\-tabs=\fIN\fR
+Replace tab characters with \fIN\fR spaces before hashing.
+.TP
+.B \-\-exclude\-preamble
+Skip the content before the first START marker.
+.TP
+.B \-\-exclude\-epilogue
+Skip the content after the last END marker.
+.TP
+.B \-\-strict\-start
+Fail if the first START marker is not on line 1.
+.TP
+.BR \-v ", " \-\-verbose
+Enable verbose output (e.g., print OK on successful check).
+.TP
+.BR \-q ", " \-\-quiet
+Suppress all output except errors.
+.SH "EXIT STATUS"
+.TP
+.B 0
+Success (hash matched).
+.TP
+.B 1
+Hash mismatch (check command only).
+.TP
+.B 2
+Invalid arguments or marker order (end before start).
+.TP
+.B 3
+Marker pair not found.
+.TP
+.B 4
+File not found.
+.TP
+.B 5
+Internal error (e.g., hasher produced no output).
+.TP
+.B 6
+Unsupported algorithm, or algorithm requires missing \fBopenssl\fR.
+.SH EXAMPLES
+.TP
+Hash the body of a C file, excluding the Doxygen header:
+.EX
+bodyhash hash file.c \-e '/**::*/'
+.EE
+.TP
+Verify the hash against a known value:
+.EX
+bodyhash check file.c 1857616f15bd53f72c1733a1839421116c7bbb50579f2cdb9ceca9adfcd30fda \-e '/**::*/'
+.EE
+.SH "SEE ALSO"
+.BR sha256sum (1),
+.BR openssl (1)

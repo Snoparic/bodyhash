@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Эрик Гусейнов-Соболь <Snoparic.job@mail.ru> (@Snoparic)
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+
+PROGNAME=bodyhash
+VERSION=1.0.0
+
+declare -a EXCLUDES=()
+ALGO=sha256
+NORM_CRLF=1
+STRIP_BOM=1
+STRIP_TRAIL_WS=1
+STRIP_LEAD_WS=0
+INDENT_TABS=0
+EXCL_PREAMBLE=0
+EXCL_EPILOGUE=0
+STRICT_START=0
+VERBOSE=0
+QUIET=0
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  bodyhash hash    FILE -e START::END [OPTIONS]
+  bodyhash check   FILE HASH -e START::END [OPTIONS]
+  bodyhash markers FILE -e START::END
+  bodyhash version | help
+
+Options:
+  -e, --exclude START::END    exclude block between markers (repeatable)
+  -a, --algo ALGO             sha256 (default) | sha512 | sha3-256 | sha3-512
+                              | blake2b | blake2s | md5
+  --no-normalize-crlf         keep CRLF/CR
+  --no-strip-bom              keep UTF-8 BOM
+  --strip-trailing-ws         strip trailing whitespace (default)
+  --no-strip-trailing-ws      keep trailing whitespace per line
+  --strip-leading-ws          strip leading whitespace per line
+  --no-strip-leading-ws       keep leading whitespace per line (default)
+  --indent-tabs=N             tabs -> N spaces
+  --exclude-preamble          skip content before first START
+  --exclude-epilogue          skip content after last END
+  --strict-start              fail if START not on line 1
+  -v, --verbose
+  -q, --quiet
+
+Exit: 0 ok, 1 mismatch, 2 args, 3 marker, 4 file, 5 internal, 6 algo
+USAGE
+}
+
+die() { echo "$PROGNAME: $*" >&2; exit 2; }
+
+run_hasher() {
+    local algo=$1
+    case $algo in
+        sha256)   sha256sum | cut -d' ' -f1 ;;
+        sha512)   sha512sum | cut -d' ' -f1 ;;
+        md5)      md5sum    | cut -d' ' -f1 ;;
+        blake2b)  b2sum -l 512 | cut -d' ' -f1 ;;
+        sha3-256|sha3-512|blake2s)
+            if command -v openssl >/dev/null 2>&1; then
+                openssl dgst -"$algo" -r | cut -d' ' -f1
+            else
+                echo "algo $algo requires openssl" >&2; return 6
+            fi ;;
+        *) echo "unsupported algo: $algo" >&2; return 6 ;;
+    esac
+}
+
+extract_body() {
+    local file=$1 ex_flat=$2
+    awk -v ex="$ex_flat" \
+        -v excl_pre="$EXCL_PREAMBLE" \
+        -v excl_epi="$EXCL_EPILOGUE" \
+        -v strict="$STRICT_START" '
+    BEGIN {
+        n = (ex == "") ? 0 : split(ex, pairs, "@@")
+        for (i=1; i<=n; i++) {
+            split(pairs[i], se, "::")
+            starts[i]=se[1]; ends[i]=se[2]; sl[i]=0; el[i]=0
+        }
+    }
+    {
+        lines[NR]=$0
+        for (i=1; i<=n; i++) {
+            if (sl[i]==0 && index($0, starts[i])>0) sl[i]=NR
+            else if (sl[i]>0 && el[i]==0 && NR>sl[i] && index($0, ends[i])>0) el[i]=NR
+        }
+    }
+    END {
+        for (i=1; i<=n; i++) {
+            if (sl[i]==0) { print "marker not found: " starts[i] > "/dev/stderr"; exit 3 }
+            if (el[i]==0) { print "marker not found: " ends[i] > "/dev/stderr"; exit 3 }
+            if (el[i]<sl[i]) { print "end before start: " starts[i] > "/dev/stderr"; exit 2 }
+        }
+        min_s=0; max_e=0
+        for (i=1; i<=n; i++) {
+            if (min_s==0 || sl[i]<min_s) min_s=sl[i]
+            if (el[i]>max_e) max_e=el[i]
+        }
+        if (strict && min_s>1) { print "strict-start: preamble not empty" > "/dev/stderr"; exit 2 }
+        for (nr=1; nr<=NR; nr++) {
+            skip=0
+            for (i=1; i<=n; i++)
+                if (sl[i]>0 && el[i]>0 && nr>=sl[i] && nr<=el[i]) skip=1
+            if (excl_pre && min_s>0 && nr<min_s) skip=1
+            if (excl_epi && max_e>0 && nr>max_e) skip=1
+            if (!skip) print lines[nr]
+        }
+    }' "$file"
+}
+
+normalize() {
+    local -a seds=()
+    [ "$STRIP_BOM"      = 1 ] && seds+=(-e '1s/^\xEF\xBB\xBF//')
+    [ "$NORM_CRLF"      = 1 ] && seds+=(-e 's/\r$//')
+    if [ "$STRIP_TRAIL_WS" = 1 ]; then
+        if [ "$NORM_CRLF" = 1 ]; then
+            seds+=(-e 's/[[:space:]]*$//')
+        else
+            seds+=(-e 's/[ \t]*$//') # Не трогаем \r
+        fi
+    fi
+    [ "$STRIP_LEAD_WS"  = 1 ] && seds+=(-e 's/^[[:space:]]*//')
+    if [ ${#seds[@]} -gt 0 ]; then
+        if [ "$INDENT_TABS" -gt 0 ]; then sed "${seds[@]}" | expand -t "$INDENT_TABS"
+        else                                sed "${seds[@]}"
+        fi
+    else
+        if [ "$INDENT_TABS" -gt 0 ]; then expand -t "$INDENT_TABS"
+        else                                cat
+        fi
+    fi
+}
+
+compute_hash() {
+    local file=$1
+    [ -f "$file" ] || die "file not found: $file"
+    local ex_flat=""
+    for ex in "${EXCLUDES[@]}"; do
+        [ -n "$ex_flat" ] && ex_flat="$ex_flat@@$ex" || ex_flat="$ex"
+    done
+    
+    local h
+    h=$(extract_body "$file" "$ex_flat" | normalize | run_hasher "$ALGO")
+    if [ -z "$h" ]; then
+        echo "$PROGNAME: internal error: empty hash for $file" >&2
+        return 5
+    fi
+    printf '%s\n' "$h"
+}
+
+cmd_hash() { compute_hash "$1"; }
+
+cmd_check() {
+    local file=$1 expected=$2
+    [ -n "$expected" ] || die "usage: check FILE HASH"
+    local actual
+    actual=$(compute_hash "$file") || return $?
+    if [ "$actual" = "$expected" ]; then
+        if [ "$VERBOSE" = 1 ] && [ "$QUIET" = 0 ]; then
+            echo "$file: OK"
+        fi
+        return 0
+    fi
+    echo "$file: mismatch (expected $expected, got $actual)" >&2
+    return 1
+}
+
+cmd_markers() {
+    local file=$1
+    [ -f "$file" ] || die "file not found: $file"
+    for ex in "${EXCLUDES[@]}"; do
+        local s="${ex%%::*}" e="${ex##*::}"
+        local sl el
+        sl=$(grep -nF -- "$s" "$file" | head -1 | cut -d: -f1)
+        el=""
+        if [ -n "$sl" ]; then
+            el=$(awk -v sl="$sl" -v e="$e" 'NR > sl && index($0, e) { print NR; exit }' "$file")
+        fi
+        printf '%s: START %s at %s\n' "$file" "$s" "${sl:-?}"
+        printf '%s: END   %s at %s\n' "$file" "$e" "${el:-?}"
+    done
+}
+
+parse_opts() {
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -e|--exclude) EXCLUDES+=("$2"); shift 2 ;;
+            -a|--algo)    ALGO="$2"; shift 2 ;;
+            --no-normalize-crlf)    NORM_CRLF=0; shift ;;
+            --no-strip-bom)         STRIP_BOM=0; shift ;;
+            --strip-trailing-ws)    STRIP_TRAIL_WS=1; shift ;;
+            --no-strip-trailing-ws) STRIP_TRAIL_WS=0; shift ;;
+            --strip-leading-ws)     STRIP_LEAD_WS=1; shift ;;
+            --no-strip-leading-ws)  STRIP_LEAD_WS=0; shift ;;
+            --indent-tabs=*)        INDENT_TABS="${1#*=}"; shift ;;
+            --exclude-preamble)     EXCL_PREAMBLE=1; shift ;;
+            --exclude-epilogue)     EXCL_EPILOGUE=1; shift ;;
+            --strict-start)         STRICT_START=1; shift ;;
+            -v|--verbose)           VERBOSE=1; shift ;;
+            -q|--quiet)             QUIET=1; shift ;;
+            --) shift; POSITIONAL+=("$@"); return ;;
+            -*) die "unknown option: $1" ;;
+            *)  POSITIONAL+=("$1"); shift ;;
+        esac
+    done
+}
+
+main() {
+    [ $# -eq 0 ] && { usage; exit 2; }
+    local cmd=$1; shift
+    case $cmd in
+        help|-h|--help)       usage; exit 0 ;;
+        version|-V|--version) echo "$PROGNAME $VERSION"; exit 0 ;;
+        hash|check|markers)   ;;
+        *) die "unknown command: $cmd" ;;
+    esac
+    declare -a POSITIONAL=()
+    parse_opts "$@"
+    [ ${#POSITIONAL[@]} -gt 0 ] || die "no input file"
+    case $cmd in
+        hash)    cmd_hash    "${POSITIONAL[0]}" ;;
+        check)   cmd_check   "${POSITIONAL[0]}" "${POSITIONAL[1]:-}" ;;
+        markers) cmd_markers "${POSITIONAL[0]}" ;;
+    esac
+}
+main "$@"
