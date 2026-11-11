@@ -1,5 +1,11 @@
 # bodyhash
 
+[![Forgejo](https://img.shields.io/badge/Forgejo-main-blue)](https://git.snoparic.su/snoparic/bodyhash)
+[![GitHub](https://img.shields.io/badge/GitHub-mirror-black)](https://github.com/Snoparic/bodyhash)
+[![GitFlic](https://img.shields.io/badge/GitFlic-mirror-green)](https://gitflic.ru/project/snoparic/bodyhash)
+
+
+
 Утилита для вычисления хеша тела файла с исключением заданных областей (например, шапок с метаданными).
 
 По умолчанию `bodyhash` нормализует концы строк (CRLF -> LF), удаляет UTF-8 BOM и убирает пробелы в конце строк. Это гарантирует, что хеш не изменится при переносе репозитория между Windows и Linux.
@@ -38,3 +44,14 @@
 
     # Проверка
     bodyhash check file.c 1857616f15bd53f72c1733a1839421116c7bbb50579f2cdb9ceca9adfcd30fda -e '/**::*/'
+
+
+---
+
+## Зеркала
+
+Основной репозиторий: [git.snoparic.su](https://git.snoparic.su/snoparic/bodyhash)
+
+Зеркала:
+- [GitHub](https://github.com/Snoparic/bodyhash)
+- [GitFlic](https://gitflic.ru/project/snoparic/bodyhash)
